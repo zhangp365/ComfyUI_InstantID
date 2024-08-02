@@ -6,12 +6,17 @@ import numpy as np
 import math
 import cv2
 import PIL.Image
-from comfy.ldm.modules.attention import optimized_attention
 from .resampler import Resampler
+from .CrossAttentionPatch import Attn2Replace, instantid_attention
+from .utils import tensor_to_image
 
 from insightface.app import FaceAnalysis
 
-import torchvision.transforms.v2 as T
+try:
+    import torchvision.transforms.v2 as T
+except ImportError:
+    import torchvision.transforms as T
+
 import torch.nn.functional as F
 import logging
 logger = logging.getLogger(__file__)
@@ -53,163 +58,6 @@ def draw_kps(image_pil, kps, color_list=[(255,0,0), (0,255,0), (0,0,255), (255,2
     out_img_pil = PIL.Image.fromarray(out_img.astype(np.uint8))
     return out_img_pil
 
-# All this mess to keep compatibility with IPAdapter, it will be helpful in case we want AnimateDiff to work with InstantID
-class CrossAttentionPatch:
-    # forward for patching
-    def __init__(self, weight, ipadapter, number, cond, uncond, weight_type="original", mask=None, sigma_start=0.0, sigma_end=1.0, unfold_batch=False):
-        self.weights = [weight]
-        self.ipadapters = [ipadapter]
-        self.conds = [cond]
-        self.unconds = [uncond]
-        self.number = number
-        self.weight_type = [weight_type]
-        self.masks = [mask]
-        self.sigma_start = [sigma_start]
-        self.sigma_end = [sigma_end]
-        self.unfold_batch = [unfold_batch]
-
-        self.k_key = str(self.number*2+1) + "_to_k_ip"
-        self.v_key = str(self.number*2+1) + "_to_v_ip"
-    
-    def set_new_condition(self, weight, ipadapter, number, cond, uncond, weight_type="original", mask=None, sigma_start=0.0, sigma_end=1.0, unfold_batch=False):
-        self.weights.append(weight)
-        self.ipadapters.append(ipadapter)
-        self.conds.append(cond)
-        self.unconds.append(uncond)
-        self.masks.append(mask)
-        self.weight_type.append(weight_type)
-        self.sigma_start.append(sigma_start)
-        self.sigma_end.append(sigma_end)
-        self.unfold_batch.append(unfold_batch)
-
-    def __call__(self, n, context_attn2, value_attn2, extra_options):
-        org_dtype = n.dtype
-        cond_or_uncond = extra_options["cond_or_uncond"]
-        sigma = extra_options["sigmas"][0] if 'sigmas' in extra_options else None
-        sigma = sigma.item() if sigma is not None else 999999999.9
-
-        # extra options for AnimateDiff
-        ad_params = extra_options['ad_params'] if "ad_params" in extra_options else None
-
-        q = n
-        k = context_attn2
-        v = value_attn2
-        b = q.shape[0]
-        qs = q.shape[1]
-        batch_prompt = b // len(cond_or_uncond)
-        out = optimized_attention(q, k, v, extra_options["n_heads"])
-        _, _, lh, lw = extra_options["original_shape"]
-        
-        for weight, cond, uncond, ipadapter, mask, weight_type, sigma_start, sigma_end, unfold_batch in zip(self.weights, self.conds, self.unconds, self.ipadapters, self.masks, self.weight_type, self.sigma_start, self.sigma_end, self.unfold_batch):
-            if sigma > sigma_start or sigma < sigma_end:
-                continue
-
-            if unfold_batch and cond.shape[0] > 1:
-                # Check AnimateDiff context window
-                if ad_params is not None and ad_params["sub_idxs"] is not None:
-                    # if images length matches or exceeds full_length get sub_idx images
-                    if cond.shape[0] >= ad_params["full_length"]:
-                        cond = torch.Tensor(cond[ad_params["sub_idxs"]])
-                        uncond = torch.Tensor(uncond[ad_params["sub_idxs"]])
-                    # otherwise, need to do more to get proper sub_idxs masks
-                    else:
-                        # check if images length matches full_length - if not, make it match
-                        if cond.shape[0] < ad_params["full_length"]:
-                            cond = torch.cat((cond, cond[-1:].repeat((ad_params["full_length"]-cond.shape[0], 1, 1))), dim=0)
-                            uncond = torch.cat((uncond, uncond[-1:].repeat((ad_params["full_length"]-uncond.shape[0], 1, 1))), dim=0)
-                        # if we have too many remove the excess (should not happen, but just in case)
-                        if cond.shape[0] > ad_params["full_length"]:
-                            cond = cond[:ad_params["full_length"]]
-                            uncond = uncond[:ad_params["full_length"]]
-                        cond = cond[ad_params["sub_idxs"]]
-                        uncond = uncond[ad_params["sub_idxs"]]
-
-                # if we don't have enough reference images repeat the last one until we reach the right size
-                if cond.shape[0] < batch_prompt:
-                    cond = torch.cat((cond, cond[-1:].repeat((batch_prompt-cond.shape[0], 1, 1))), dim=0)
-                    uncond = torch.cat((uncond, uncond[-1:].repeat((batch_prompt-uncond.shape[0], 1, 1))), dim=0)
-                # if we have too many remove the exceeding
-                elif cond.shape[0] > batch_prompt:
-                    cond = cond[:batch_prompt]
-                    uncond = uncond[:batch_prompt]
-
-                k_cond = ipadapter.ip_layers.to_kvs[self.k_key](cond)
-                k_uncond = ipadapter.ip_layers.to_kvs[self.k_key](uncond)
-                v_cond = ipadapter.ip_layers.to_kvs[self.v_key](cond)
-                v_uncond = ipadapter.ip_layers.to_kvs[self.v_key](uncond)
-            else:
-                k_cond = ipadapter.ip_layers.to_kvs[self.k_key](cond).repeat(batch_prompt, 1, 1)
-                k_uncond = ipadapter.ip_layers.to_kvs[self.k_key](uncond).repeat(batch_prompt, 1, 1)
-                v_cond = ipadapter.ip_layers.to_kvs[self.v_key](cond).repeat(batch_prompt, 1, 1)
-                v_uncond = ipadapter.ip_layers.to_kvs[self.v_key](uncond).repeat(batch_prompt, 1, 1)
-
-            if weight_type.startswith("linear"):
-                ip_k = torch.cat([(k_cond, k_uncond)[i] for i in cond_or_uncond], dim=0) * weight
-                ip_v = torch.cat([(v_cond, v_uncond)[i] for i in cond_or_uncond], dim=0) * weight
-            else:
-                ip_k = torch.cat([(k_cond, k_uncond)[i] for i in cond_or_uncond], dim=0)
-                ip_v = torch.cat([(v_cond, v_uncond)[i] for i in cond_or_uncond], dim=0)
-
-                if weight_type.startswith("channel"):
-                    # code by Lvmin Zhang at Stanford University as also seen on Fooocus IPAdapter implementation
-                    ip_v_mean = torch.mean(ip_v, dim=1, keepdim=True)
-                    ip_v_offset = ip_v - ip_v_mean
-                    _, _, C = ip_k.shape
-                    channel_penalty = float(C) / 1280.0
-                    W = weight * channel_penalty
-                    ip_k = ip_k * W
-                    ip_v = ip_v_offset + ip_v_mean * W
-
-            out_ip = optimized_attention(q, ip_k, ip_v, extra_options["n_heads"])           
-            if weight_type.startswith("original"):
-                out_ip = out_ip * weight
-
-            if mask is not None:
-                # TODO: needs checking
-                mask_h = lh / math.sqrt(lh * lw / qs)
-                mask_h = int(mask_h) + int((qs % int(mask_h)) != 0)
-                mask_w = qs // mask_h
-
-                # check if using AnimateDiff and sliding context window
-                if (mask.shape[0] > 1 and ad_params is not None and ad_params["sub_idxs"] is not None):
-                    # if mask length matches or exceeds full_length, just get sub_idx masks, resize, and continue
-                    if mask.shape[0] >= ad_params["full_length"]:
-                        mask_downsample = torch.Tensor(mask[ad_params["sub_idxs"]])
-                        mask_downsample = F.interpolate(mask_downsample.unsqueeze(1), size=(mask_h, mask_w), mode="bicubic").squeeze(1)
-                    # otherwise, need to do more to get proper sub_idxs masks
-                    else:
-                        # resize to needed attention size (to save on memory)
-                        mask_downsample = F.interpolate(mask.unsqueeze(1), size=(mask_h, mask_w), mode="bicubic").squeeze(1)
-                        # check if mask length matches full_length - if not, make it match
-                        if mask_downsample.shape[0] < ad_params["full_length"]:
-                            mask_downsample = torch.cat((mask_downsample, mask_downsample[-1:].repeat((ad_params["full_length"]-mask_downsample.shape[0], 1, 1))), dim=0)
-                        # if we have too many remove the excess (should not happen, but just in case)
-                        if mask_downsample.shape[0] > ad_params["full_length"]:
-                            mask_downsample = mask_downsample[:ad_params["full_length"]]
-                        # now, select sub_idxs masks
-                        mask_downsample = mask_downsample[ad_params["sub_idxs"]]
-                # otherwise, perform usual mask interpolation
-                else:
-                    mask_downsample = F.interpolate(mask.unsqueeze(1), size=(mask_h, mask_w), mode="bicubic").squeeze(1)
-
-                # if we don't have enough masks repeat the last one until we reach the right size
-                if mask_downsample.shape[0] < batch_prompt:
-                    mask_downsample = torch.cat((mask_downsample, mask_downsample[-1:, :, :].repeat((batch_prompt-mask_downsample.shape[0], 1, 1))), dim=0)
-                # if we have too many remove the exceeding
-                elif mask_downsample.shape[0] > batch_prompt:
-                    mask_downsample = mask_downsample[:batch_prompt, :, :]
-                
-                # repeat the masks
-                mask_downsample = mask_downsample.repeat(len(cond_or_uncond), 1, 1)
-                mask_downsample = mask_downsample.view(mask_downsample.shape[0], -1, 1).repeat(1, 1, out.shape[2])
-
-                out_ip = out_ip * mask_downsample
-
-            out = out + out_ip
-
-        return out.to(dtype=org_dtype)
-
-
 class InstantID(torch.nn.Module):
     def __init__(self, instantid_model, cross_attention_dim=1280, output_cross_attention_dim=1024, clip_embeddings_dim=512, clip_extra_context_tokens=16):
         super().__init__()
@@ -249,12 +97,12 @@ class InstantID(torch.nn.Module):
 class ImageProjModel(torch.nn.Module):
     def __init__(self, cross_attention_dim=1024, clip_embeddings_dim=1024, clip_extra_context_tokens=4):
         super().__init__()
-        
+
         self.cross_attention_dim = cross_attention_dim
         self.clip_extra_context_tokens = clip_extra_context_tokens
         self.proj = torch.nn.Linear(clip_embeddings_dim, self.clip_extra_context_tokens * cross_attention_dim)
         self.norm = torch.nn.LayerNorm(cross_attention_dim)
-        
+
     def forward(self, image_embeds):
         embeds = image_embeds
         clip_extra_context_tokens = self.proj(embeds).reshape(-1, self.clip_extra_context_tokens, self.cross_attention_dim)
@@ -272,15 +120,22 @@ class To_KV(torch.nn.Module):
             self.to_kvs[k].weight.data = value
 
 def _set_model_patch_replace(model, patch_kwargs, key):
-    to = model.model_options["transformer_options"]
+    to = model.model_options["transformer_options"].copy()
     if "patches_replace" not in to:
         to["patches_replace"] = {}
+    else:
+        to["patches_replace"] = to["patches_replace"].copy()
+
     if "attn2" not in to["patches_replace"]:
         to["patches_replace"]["attn2"] = {}
-    if key not in to["patches_replace"]["attn2"]:
-        to["patches_replace"]["attn2"][key] = CrossAttentionPatch(**patch_kwargs)
     else:
-        to["patches_replace"]["attn2"][key].set_new_condition(**patch_kwargs)
+        to["patches_replace"]["attn2"] = to["patches_replace"]["attn2"].copy()
+    
+    if key not in to["patches_replace"]["attn2"]:
+        to["patches_replace"]["attn2"][key] = Attn2Replace(instantid_attention, **patch_kwargs)
+        model.model_options["transformer_options"] = to
+    else:
+        to["patches_replace"]["attn2"][key].add(instantid_attention, **patch_kwargs)
 
 class InstantIDModelLoader:
     @classmethod
@@ -304,17 +159,19 @@ class InstantIDModelLoader:
                 elif key.startswith("ip_adapter."):
                     st_model["ip_adapter"][key.replace("ip_adapter.", "")] = model[key]
             model = st_model
-        
+
+        model = InstantID(
+            model,
+            cross_attention_dim=1280,
+            output_cross_attention_dim=model["ip_adapter"]["1.to_k_ip.weight"].shape[1],
+            clip_embeddings_dim=512,
+            clip_extra_context_tokens=16,
+        )
+
         return (model,)
 
-def tensorToNP(image):
-    out = torch.clamp(255. * image.detach().cpu(), 0, 255).to(torch.uint8)
-    out = out[..., [2, 1, 0]]
-    out = out.numpy()
-    return out
-
 def extractFeatures(insightface, image, extract_kps=False):
-    face_img = tensorToNP(image)
+    face_img = tensor_to_image(image)
     out = []
     logger.debug(f"start extract features, extract kps:{extract_kps}")
     insightface.det_model.input_size = (640,640) # reset the detection size
@@ -324,7 +181,7 @@ def extractFeatures(insightface, image, extract_kps=False):
             insightface.det_model.input_size = size # TODO: hacky but seems to be working
             face = insightface.get(face_img[i])
             if face:
-                face = sorted(face, key=lambda x:(x['bbox'][2]-x['bbox'][0])*x['bbox'][3]-x['bbox'][1])[-1]
+                face = sorted(face, key=lambda x:(x['bbox'][2]-x['bbox'][0])*(x['bbox'][3]-x['bbox'][1]))[-1]
 
                 if extract_kps:
                     out.append(draw_kps(face_img[i], face['kps']))
@@ -359,7 +216,7 @@ class InstantIDFaceAnalysis:
     CATEGORY = "InstantID"
 
     def load_insight_face(self, provider):
-        model = FaceAnalysis(name="antelopev2", root=INSIGHTFACE_DIR, providers=[provider + 'ExecutionProvider',]) # buffalo_l
+        model = FaceAnalysis(name="antelopev2", root=INSIGHTFACE_DIR, providers=[provider + 'ExecutionProvider',]) # alternative to buffalo_l
         model.prepare(ctx_id=0, det_size=(640, 640))
 
         return (model,)
@@ -393,13 +250,12 @@ def add_noise(image, factor):
     mask = (torch.rand_like(image) < factor).float()
     noise = torch.rand_like(image)
     noise = torch.zeros_like(image) * (1-mask) + noise * mask
-    
+
     return factor*noise
 
 class ApplyInstantID:
     def __init__(self) -> None:
         self.instantid = None
-        self.instantid_key = None
         self.current_work_model = None
         
     @classmethod
@@ -428,18 +284,13 @@ class ApplyInstantID:
     FUNCTION = "apply_instantid"
     CATEGORY = "InstantID"
 
-    def apply_instantid(self, instantid, insightface, control_net, image, model, positive, negative, start_at, end_at, weight=.8, ip_weight=None, cn_strength=None, noise=0.35, image_kps=None, mask=None):
+    def apply_instantid(self, instantid, insightface, control_net, image, model, positive, negative, start_at, end_at, weight=.8, ip_weight=None, cn_strength=None, noise=0.35, image_kps=None, mask=None, combine_embeds='average'):
         logger.debug(f"start apply_instantid......")
         self.dtype = torch.float16 if comfy.model_management.should_use_fp16() else torch.float32
         self.device = comfy.model_management.get_torch_device()
 
         ip_weight = weight if ip_weight is None else ip_weight
         cn_strength = weight if cn_strength is None else cn_strength
-
-        output_cross_attention_dim = instantid["ip_adapter"]["1.to_k_ip.weight"].shape[1]
-        is_sdxl = output_cross_attention_dim == 2048
-        cross_attention_dim = 1280
-        clip_extra_context_tokens = 16
 
         face_embed = extractFeatures(insightface, image)
         if face_embed is None:
@@ -455,7 +306,10 @@ class ApplyInstantID:
         clip_embed = face_embed
         # InstantID works better with averaged embeds (TODO: needs testing)
         if clip_embed.shape[0] > 1:
-            clip_embed = torch.mean(clip_embed, dim=0).unsqueeze(0)
+            if combine_embeds == 'average':
+                clip_embed = torch.mean(clip_embed, dim=0).unsqueeze(0)
+            elif combine_embeds == 'norm average':
+                clip_embed = torch.mean(clip_embed / torch.norm(clip_embed, dim=0, keepdim=True), dim=0).unsqueeze(0)
 
         if noise > 0:
             seed = int(torch.sum(clip_embed).item()) % 1000000007
@@ -468,18 +322,9 @@ class ApplyInstantID:
         clip_embeddings_dim = face_embed.shape[-1]
         logger.debug(f"before initialize instantid")
 
-        instantid_key = f"{cross_attention_dim}_{output_cross_attention_dim}_{clip_embeddings_dim}_{clip_extra_context_tokens}"
-        if instantid_key != self.instantid_key:
-            self.instantid_key = instantid_key    
+        if self.instantid != instantid :
             # 1: patch the attention
-            self.instantid = InstantID(
-                instantid,
-                cross_attention_dim=cross_attention_dim,
-                output_cross_attention_dim=output_cross_attention_dim,
-                clip_embeddings_dim=clip_embeddings_dim,
-                clip_extra_context_tokens=clip_extra_context_tokens,
-            )
-            logger.debug(f"after initialize instantid")
+            self.instantid = instantid
             self.instantid.to(self.device, dtype=self.dtype)
             logger.debug(f"after instantid to device")
 
@@ -490,50 +335,42 @@ class ApplyInstantID:
         uncond_image_prompt_embeds = uncond_image_prompt_embeds.to(self.device, dtype=self.dtype)
         logger.debug(f"after embeds to device, start model operation.")
         work_model = model
-        
-        sigma_start = work_model.model.model_sampling.percent_to_sigma(start_at)
-        sigma_end = work_model.model.model_sampling.percent_to_sigma(end_at)
+        sigma_start = model.get_model_object("model_sampling").percent_to_sigma(start_at)
+        sigma_end = model.get_model_object("model_sampling").percent_to_sigma(end_at)
 
         if mask is not None:
             mask = mask.to(self.device)
         if self.current_work_model != work_model:
-            logger.debug(f"start set model patch")
             patch_kwargs = {
-                "number": 0,
-                "weight": ip_weight,
                 "ipadapter": self.instantid,
+                "weight": ip_weight,
                 "cond": image_prompt_embeds,
                 "uncond": uncond_image_prompt_embeds,
                 "mask": mask,
                 "sigma_start": sigma_start,
                 "sigma_end": sigma_end,
-                "weight_type": "original",
             }
 
-            if not is_sdxl:
-                for id in [1,2,4,5,7,8]: # id of input_blocks that have cross attention
-                    _set_model_patch_replace(work_model, patch_kwargs, ("input", id))
-                    patch_kwargs["number"] += 1
-                for id in [3,4,5,6,7,8,9,10,11]: # id of output_blocks that have cross attention
-                    _set_model_patch_replace(work_model, patch_kwargs, ("output", id))
-                    patch_kwargs["number"] += 1
-                _set_model_patch_replace(work_model, patch_kwargs, ("middle", 0))
-            else:
-                for id in [4,5,7,8]: # id of input_blocks that have cross attention
-                    block_indices = range(2) if id in [4, 5] else range(10) # transformer_depth
-                    for index in block_indices:
-                        _set_model_patch_replace(work_model, patch_kwargs, ("input", id, index))
-                        patch_kwargs["number"] += 1
-                for id in range(6): # id of output_blocks that have cross attention
-                    block_indices = range(2) if id in [3, 4, 5] else range(10) # transformer_depth
-                    for index in block_indices:
-                        _set_model_patch_replace(work_model, patch_kwargs, ("output", id, index))
-                        patch_kwargs["number"] += 1
-                for index in range(10):
-                    _set_model_patch_replace(work_model, patch_kwargs, ("middle", 0, index))
-                    patch_kwargs["number"] += 1
-            
+            number = 0
+            for id in [4,5,7,8]: # id of input_blocks that have cross attention
+                block_indices = range(2) if id in [4, 5] else range(10) # transformer_depth
+                for index in block_indices:
+                    patch_kwargs["module_key"] = str(number*2+1)
+                    _set_model_patch_replace(work_model, patch_kwargs, ("input", id, index))
+                    number += 1
+            for id in range(6): # id of output_blocks that have cross attention
+                block_indices = range(2) if id in [3, 4, 5] else range(10) # transformer_depth
+                for index in block_indices:
+                    patch_kwargs["module_key"] = str(number*2+1)
+                    _set_model_patch_replace(work_model, patch_kwargs, ("output", id, index))
+                    number += 1
+            for index in range(10):
+                patch_kwargs["module_key"] = str(number*2+1)
+                _set_model_patch_replace(work_model, patch_kwargs, ("middle", 0, index))
+                number += 1
+                
             self.current_work_model = work_model
+
         # 2: do the ControlNet
         if mask is not None and len(mask.shape) < 3:
             mask = mask.unsqueeze(0)
@@ -587,6 +424,7 @@ class ApplyInstantIDAdvanced(ApplyInstantID):
                 "start_at": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.001, }),
                 "end_at": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.001, }),
                 "noise": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.1, }),
+                "combine_embeds": (['average', 'norm average', 'concat'], {"default": 'average'}),
             },
             "optional": {
                 "image_kps": ("IMAGE",),
@@ -617,14 +455,9 @@ class InstantIDAttentionPatch:
     FUNCTION = "patch_attention"
     CATEGORY = "InstantID"
 
-    def patch_attention(self, instantid, insightface, image, model, weight, start_at, end_at, noise=0.0, mask=None):       
+    def patch_attention(self, instantid, insightface, image, model, weight, start_at, end_at, noise=0.0, mask=None):
         self.dtype = torch.float16 if comfy.model_management.should_use_fp16() else torch.float32
         self.device = comfy.model_management.get_torch_device()
-
-        output_cross_attention_dim = instantid["ip_adapter"]["1.to_k_ip.weight"].shape[1]
-        is_sdxl = output_cross_attention_dim == 2048
-        cross_attention_dim = 1280
-        clip_extra_context_tokens = 16
 
         face_embed = extractFeatures(insightface, image)
         if face_embed is None:
@@ -642,17 +475,8 @@ class InstantIDAttentionPatch:
         else:
             clip_embed_zeroed = torch.zeros_like(clip_embed)
 
-        clip_embeddings_dim = face_embed.shape[-1]
-
         # 1: patch the attention
-        self.instantid = InstantID(
-            instantid,
-            cross_attention_dim=cross_attention_dim,
-            output_cross_attention_dim=output_cross_attention_dim,
-            clip_embeddings_dim=clip_embeddings_dim,
-            clip_extra_context_tokens=clip_extra_context_tokens,
-        )
-
+        self.instantid = instantid
         self.instantid.to(self.device, dtype=self.dtype)
 
         image_prompt_embeds, uncond_image_prompt_embeds = self.instantid.get_image_embeds(clip_embed.to(self.device, dtype=self.dtype), clip_embed_zeroed.to(self.device, dtype=self.dtype))
@@ -665,14 +489,13 @@ class InstantIDAttentionPatch:
 
         work_model = model.clone()
 
-        sigma_start = work_model.model.model_sampling.percent_to_sigma(start_at)
-        sigma_end = work_model.model.model_sampling.percent_to_sigma(end_at)
+        sigma_start = model.get_model_object("model_sampling").percent_to_sigma(start_at)
+        sigma_end = model.get_model_object("model_sampling").percent_to_sigma(end_at)
 
         if mask is not None:
             mask = mask.to(self.device)
 
         patch_kwargs = {
-            "number": 0,
             "weight": weight,
             "ipadapter": self.instantid,
             "cond": image_prompt_embeds,
@@ -680,32 +503,26 @@ class InstantIDAttentionPatch:
             "mask": mask,
             "sigma_start": sigma_start,
             "sigma_end": sigma_end,
-            "weight_type": "original",
         }
 
-        if not is_sdxl:
-            for id in [1,2,4,5,7,8]: # id of input_blocks that have cross attention
-                _set_model_patch_replace(work_model, patch_kwargs, ("input", id))
-                patch_kwargs["number"] += 1
-            for id in [3,4,5,6,7,8,9,10,11]: # id of output_blocks that have cross attention
-                _set_model_patch_replace(work_model, patch_kwargs, ("output", id))
-                patch_kwargs["number"] += 1
-            _set_model_patch_replace(work_model, patch_kwargs, ("middle", 0))
-        else:
-            for id in [4,5,7,8]: # id of input_blocks that have cross attention
-                block_indices = range(2) if id in [4, 5] else range(10) # transformer_depth
-                for index in block_indices:
-                    _set_model_patch_replace(work_model, patch_kwargs, ("input", id, index))
-                    patch_kwargs["number"] += 1
-            for id in range(6): # id of output_blocks that have cross attention
-                block_indices = range(2) if id in [3, 4, 5] else range(10) # transformer_depth
-                for index in block_indices:
-                    _set_model_patch_replace(work_model, patch_kwargs, ("output", id, index))
-                    patch_kwargs["number"] += 1
-            for index in range(10):
-                _set_model_patch_replace(work_model, patch_kwargs, ("middle", 0, index))
-                patch_kwargs["number"] += 1
-        
+        number = 0
+        for id in [4,5,7,8]: # id of input_blocks that have cross attention
+            block_indices = range(2) if id in [4, 5] else range(10) # transformer_depth
+            for index in block_indices:
+                patch_kwargs["module_key"] = str(number*2+1)
+                _set_model_patch_replace(work_model, patch_kwargs, ("input", id, index))
+                number += 1
+        for id in range(6): # id of output_blocks that have cross attention
+            block_indices = range(2) if id in [3, 4, 5] else range(10) # transformer_depth
+            for index in block_indices:
+                patch_kwargs["module_key"] = str(number*2+1)
+                _set_model_patch_replace(work_model, patch_kwargs, ("output", id, index))
+                number += 1
+        for index in range(10):
+            patch_kwargs["module_key"] = str(number*2+1)
+            _set_model_patch_replace(work_model, patch_kwargs, ("middle", 0, index))
+            number += 1
+
         return(work_model, { "cond": image_prompt_embeds, "uncond": uncond_image_prompt_embeds }, )
 
 class ApplyInstantIDControlNet:
@@ -740,7 +557,7 @@ class ApplyInstantIDControlNet:
 
         if mask is not None:
             mask = mask.to(self.device)
-        
+
         if mask is not None and len(mask.shape) < 3:
             mask = mask.unsqueeze(0)
 
@@ -777,8 +594,6 @@ class ApplyInstantIDControlNet:
                 c.append(n)
             cond_uncond.append(c)
             is_cond = False
-
-            print(cond_uncond[0])
 
         return(cond_uncond[0], cond_uncond[1])
 
