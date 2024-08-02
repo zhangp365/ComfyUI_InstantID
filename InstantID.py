@@ -13,6 +13,8 @@ from insightface.app import FaceAnalysis
 
 import torchvision.transforms.v2 as T
 import torch.nn.functional as F
+import logging
+logger = logging.getLogger(__file__)
 
 MODELS_DIR = os.path.join(folder_paths.models_dir, "instantid")
 if "instantid" not in folder_paths.folder_names_and_paths:
@@ -314,7 +316,7 @@ def tensorToNP(image):
 def extractFeatures(insightface, image, extract_kps=False):
     face_img = tensorToNP(image)
     out = []
-
+    logger.debug(f"start extract features, extract kps:{extract_kps}")
     insightface.det_model.input_size = (640,640) # reset the detection size
 
     for i in range(face_img.shape[0]):
@@ -340,7 +342,7 @@ def extractFeatures(insightface, image, extract_kps=False):
             out = torch.stack(out, dim=0)
     else:
         out = None
-
+    logger.debug(f"after extract features, extract kps:{extract_kps}")
     return out
 
 class InstantIDFaceAnalysis:
@@ -395,6 +397,11 @@ def add_noise(image, factor):
     return factor*noise
 
 class ApplyInstantID:
+    def __init__(self) -> None:
+        self.instantid = None
+        self.instantid_key = None
+        self.current_work_model = None
+        
     @classmethod
     def INPUT_TYPES(s):
         return {
@@ -422,6 +429,7 @@ class ApplyInstantID:
     CATEGORY = "InstantID"
 
     def apply_instantid(self, instantid, insightface, control_net, image, model, positive, negative, start_at, end_at, weight=.8, ip_weight=None, cn_strength=None, noise=0.35, image_kps=None, mask=None):
+        logger.debug(f"start apply_instantid......")
         self.dtype = torch.float16 if comfy.model_management.should_use_fp16() else torch.float32
         self.device = comfy.model_management.get_torch_device()
 
@@ -458,66 +466,74 @@ class ApplyInstantID:
             clip_embed_zeroed = torch.zeros_like(clip_embed)
 
         clip_embeddings_dim = face_embed.shape[-1]
+        logger.debug(f"before initialize instantid")
 
-        # 1: patch the attention
-        self.instantid = InstantID(
-            instantid,
-            cross_attention_dim=cross_attention_dim,
-            output_cross_attention_dim=output_cross_attention_dim,
-            clip_embeddings_dim=clip_embeddings_dim,
-            clip_extra_context_tokens=clip_extra_context_tokens,
-        )
-
-        self.instantid.to(self.device, dtype=self.dtype)
+        instantid_key = f"{cross_attention_dim}_{output_cross_attention_dim}_{clip_embeddings_dim}_{clip_extra_context_tokens}"
+        if instantid_key != self.instantid_key:
+            self.instantid_key = instantid_key    
+            # 1: patch the attention
+            self.instantid = InstantID(
+                instantid,
+                cross_attention_dim=cross_attention_dim,
+                output_cross_attention_dim=output_cross_attention_dim,
+                clip_embeddings_dim=clip_embeddings_dim,
+                clip_extra_context_tokens=clip_extra_context_tokens,
+            )
+            logger.debug(f"after initialize instantid")
+            self.instantid.to(self.device, dtype=self.dtype)
+            logger.debug(f"after instantid to device")
 
         image_prompt_embeds, uncond_image_prompt_embeds = self.instantid.get_image_embeds(clip_embed.to(self.device, dtype=self.dtype), clip_embed_zeroed.to(self.device, dtype=self.dtype))
+        logger.debug(f"after instantid model get image enbeds")
 
         image_prompt_embeds = image_prompt_embeds.to(self.device, dtype=self.dtype)
         uncond_image_prompt_embeds = uncond_image_prompt_embeds.to(self.device, dtype=self.dtype)
-
-        work_model = model.clone()
-
+        logger.debug(f"after embeds to device, start model operation.")
+        work_model = model
+        
         sigma_start = work_model.model.model_sampling.percent_to_sigma(start_at)
         sigma_end = work_model.model.model_sampling.percent_to_sigma(end_at)
 
         if mask is not None:
             mask = mask.to(self.device)
+        if self.current_work_model != work_model:
+            logger.debug(f"start set model patch")
+            patch_kwargs = {
+                "number": 0,
+                "weight": ip_weight,
+                "ipadapter": self.instantid,
+                "cond": image_prompt_embeds,
+                "uncond": uncond_image_prompt_embeds,
+                "mask": mask,
+                "sigma_start": sigma_start,
+                "sigma_end": sigma_end,
+                "weight_type": "original",
+            }
 
-        patch_kwargs = {
-            "number": 0,
-            "weight": ip_weight,
-            "ipadapter": self.instantid,
-            "cond": image_prompt_embeds,
-            "uncond": uncond_image_prompt_embeds,
-            "mask": mask,
-            "sigma_start": sigma_start,
-            "sigma_end": sigma_end,
-            "weight_type": "original",
-        }
-
-        if not is_sdxl:
-            for id in [1,2,4,5,7,8]: # id of input_blocks that have cross attention
-                _set_model_patch_replace(work_model, patch_kwargs, ("input", id))
-                patch_kwargs["number"] += 1
-            for id in [3,4,5,6,7,8,9,10,11]: # id of output_blocks that have cross attention
-                _set_model_patch_replace(work_model, patch_kwargs, ("output", id))
-                patch_kwargs["number"] += 1
-            _set_model_patch_replace(work_model, patch_kwargs, ("middle", 0))
-        else:
-            for id in [4,5,7,8]: # id of input_blocks that have cross attention
-                block_indices = range(2) if id in [4, 5] else range(10) # transformer_depth
-                for index in block_indices:
-                    _set_model_patch_replace(work_model, patch_kwargs, ("input", id, index))
+            if not is_sdxl:
+                for id in [1,2,4,5,7,8]: # id of input_blocks that have cross attention
+                    _set_model_patch_replace(work_model, patch_kwargs, ("input", id))
                     patch_kwargs["number"] += 1
-            for id in range(6): # id of output_blocks that have cross attention
-                block_indices = range(2) if id in [3, 4, 5] else range(10) # transformer_depth
-                for index in block_indices:
-                    _set_model_patch_replace(work_model, patch_kwargs, ("output", id, index))
+                for id in [3,4,5,6,7,8,9,10,11]: # id of output_blocks that have cross attention
+                    _set_model_patch_replace(work_model, patch_kwargs, ("output", id))
                     patch_kwargs["number"] += 1
-            for index in range(10):
-                _set_model_patch_replace(work_model, patch_kwargs, ("middle", 0, index))
-                patch_kwargs["number"] += 1
-
+                _set_model_patch_replace(work_model, patch_kwargs, ("middle", 0))
+            else:
+                for id in [4,5,7,8]: # id of input_blocks that have cross attention
+                    block_indices = range(2) if id in [4, 5] else range(10) # transformer_depth
+                    for index in block_indices:
+                        _set_model_patch_replace(work_model, patch_kwargs, ("input", id, index))
+                        patch_kwargs["number"] += 1
+                for id in range(6): # id of output_blocks that have cross attention
+                    block_indices = range(2) if id in [3, 4, 5] else range(10) # transformer_depth
+                    for index in block_indices:
+                        _set_model_patch_replace(work_model, patch_kwargs, ("output", id, index))
+                        patch_kwargs["number"] += 1
+                for index in range(10):
+                    _set_model_patch_replace(work_model, patch_kwargs, ("middle", 0, index))
+                    patch_kwargs["number"] += 1
+            
+            self.current_work_model = work_model
         # 2: do the ControlNet
         if mask is not None and len(mask.shape) < 3:
             mask = mask.unsqueeze(0)
