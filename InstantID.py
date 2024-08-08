@@ -55,6 +55,7 @@ def draw_kps(image_pil, kps, color_list=[(255,0,0), (0,255,0), (0,0,255), (255,2
         x, y = kp
         out_img = cv2.circle(out_img.copy(), (int(x), int(y)), 10, color, -1)
 
+    # cv2.imwrite("new_kps.jpg",out_img)
     out_img_pil = PIL.Image.fromarray(out_img.astype(np.uint8))
     return out_img_pil
 
@@ -170,6 +171,13 @@ class InstantIDModelLoader:
 
         return (model,)
 
+def get_kps_tensor(image, kps):
+    face_img = tensor_to_image(image)
+    out = []
+    out.append(draw_kps(face_img[0], kps))
+    out = torch.stack(T.ToTensor()(out), dim=0).permute([0,2,3,1])
+    return out
+
 def extractFeatures(insightface, image, extract_kps=False):
     face_img = tensor_to_image(image)
     out = []
@@ -275,6 +283,7 @@ class ApplyInstantID:
             },
             "optional": {
                 "image_kps": ("IMAGE",),
+                "face_kps": ("FACE_KPS",),
                 "mask": ("MASK",),
             }
         }
@@ -284,7 +293,7 @@ class ApplyInstantID:
     FUNCTION = "apply_instantid"
     CATEGORY = "InstantID"
 
-    def apply_instantid(self, instantid, insightface, control_net, image, model, positive, negative, start_at, end_at, weight=.8, ip_weight=None, cn_strength=None, noise=0.35, image_kps=None, mask=None, combine_embeds='average'):
+    def apply_instantid(self, instantid, insightface, control_net, image, model, positive, negative, start_at, end_at, weight=.8, ip_weight=None, cn_strength=None, noise=0.35, image_kps=None, mask=None, combine_embeds='average',face_kps =None):
         logger.debug(f"start apply_instantid......")
         self.dtype = torch.float16 if comfy.model_management.should_use_fp16() else torch.float32
         self.device = comfy.model_management.get_torch_device()
@@ -296,8 +305,11 @@ class ApplyInstantID:
         if face_embed is None:
             raise Exception('Reference Image: No face detected.')
 
-        # if no keypoints image is provided, use the image itself (only the first one in the batch)
-        face_kps = extractFeatures(insightface, image_kps if image_kps is not None else image[0].unsqueeze(0), extract_kps=True)
+        if face_kps is not None:
+            face_kps = get_kps_tensor(image_kps, face_kps)
+        else:
+            # if no keypoints image is provided, use the image itself (only the first one in the batch)
+            face_kps = extractFeatures(insightface, image_kps if image_kps is not None else image[0].unsqueeze(0), extract_kps=True)
 
         if face_kps is None:
             face_kps = torch.zeros_like(image) if image_kps is None else image_kps
@@ -428,6 +440,7 @@ class ApplyInstantIDAdvanced(ApplyInstantID):
             },
             "optional": {
                 "image_kps": ("IMAGE",),
+                "face_kps": ("FACE_KPS",),
                 "mask": ("MASK",),
             }
         }
