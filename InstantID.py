@@ -419,6 +419,127 @@ class ApplyInstantID:
 
         return(work_model, cond_uncond[0], cond_uncond[1], )
 
+class ApplyInstantIDOnlyIpadapter:
+    def __init__(self) -> None:
+        self.instantid = None
+        self.current_work_model = None
+        
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "instantid": ("INSTANTID", ),
+                "insightface": ("FACEANALYSIS", ),
+                "image": ("IMAGE", ),
+                "model": ("MODEL", ),
+                "weight": ("FLOAT", {"default": .8, "min": 0.0, "max": 5.0, "step": 0.01, }),
+                "start_at": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.001, }),
+                "end_at": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.001, }),
+            },
+            "optional": {
+                "image_kps": ("IMAGE",),
+                "face_kps": ("FACE_KPS",),
+                "mask": ("MASK",),
+            }
+        }
+    
+    RETURN_TYPES = ("MODEL", "EMBEDDING","EMBEDDING", "IMAGE", "MASK")
+    RETURN_NAMES = ("MODEL", "image_prompt_embeds","uncond_image_prompt_embeds","face_kps_image", "mask")
+    FUNCTION = "apply_instantid"
+    CATEGORY = "InstantID"
+
+    def apply_instantid(self, instantid, insightface, image, model, start_at, end_at, weight=.8, ip_weight=None, cn_strength=None, noise=0.35, image_kps=None, mask=None, combine_embeds='average',face_kps =None):
+        logger.debug(f"start apply_instantid......")
+        self.dtype = torch.float16 if comfy.model_management.should_use_fp16() else torch.float32
+        self.device = comfy.model_management.get_torch_device()
+
+        ip_weight = weight if ip_weight is None else ip_weight
+        cn_strength = weight if cn_strength is None else cn_strength
+
+        face_embed = extractFeatures(insightface, image)
+        if face_embed is None:
+            raise Exception('Reference Image: No face detected.')
+
+        if face_kps is not None:
+            face_kps = get_kps_tensor(image_kps, face_kps)
+        else:
+            # if no keypoints image is provided, use the image itself (only the first one in the batch)
+            face_kps = extractFeatures(insightface, image_kps if image_kps is not None else image[0].unsqueeze(0), extract_kps=True)
+
+        if face_kps is None:
+            face_kps = torch.zeros_like(image) if image_kps is None else image_kps
+            print(f"\033[33mWARNING: No face detected in the keypoints image!\033[0m")
+
+        clip_embed = face_embed
+        # InstantID works better with averaged embeds (TODO: needs testing)
+        if clip_embed.shape[0] > 1:
+            if combine_embeds == 'average':
+                clip_embed = torch.mean(clip_embed, dim=0).unsqueeze(0)
+            elif combine_embeds == 'norm average':
+                clip_embed = torch.mean(clip_embed / torch.norm(clip_embed, dim=0, keepdim=True), dim=0).unsqueeze(0)
+
+        if noise > 0:
+            seed = int(torch.sum(clip_embed).item()) % 1000000007
+            torch.manual_seed(seed)
+            clip_embed_zeroed = noise * torch.rand_like(clip_embed)
+            #clip_embed_zeroed = add_noise(clip_embed, noise)
+        else:
+            clip_embed_zeroed = torch.zeros_like(clip_embed)
+
+        clip_embeddings_dim = face_embed.shape[-1]
+        logger.debug(f"before initialize instantid")
+
+        if self.instantid != instantid :
+            # 1: patch the attention
+            self.instantid = instantid
+            self.instantid.to(self.device, dtype=self.dtype)
+            logger.debug(f"after instantid to device")
+
+        image_prompt_embeds, uncond_image_prompt_embeds = self.instantid.get_image_embeds(clip_embed.to(self.device, dtype=self.dtype), clip_embed_zeroed.to(self.device, dtype=self.dtype))
+        logger.debug(f"after instantid model get image enbeds")
+
+        image_prompt_embeds = image_prompt_embeds.to(self.device, dtype=self.dtype)
+        uncond_image_prompt_embeds = uncond_image_prompt_embeds.to(self.device, dtype=self.dtype)
+        logger.debug(f"after embeds to device, start model operation.")
+        work_model = model
+        sigma_start = model.get_model_object("model_sampling").percent_to_sigma(start_at)
+        sigma_end = model.get_model_object("model_sampling").percent_to_sigma(end_at)
+
+        if mask is not None:
+            mask = mask.to(self.device)
+        if self.current_work_model != work_model:
+            patch_kwargs = {
+                "ipadapter": self.instantid,
+                "weight": ip_weight,
+                "cond": image_prompt_embeds,
+                "uncond": uncond_image_prompt_embeds,
+                "mask": mask,
+                "sigma_start": sigma_start,
+                "sigma_end": sigma_end,
+            }
+
+            number = 0
+            for id in [4,5,7,8]: # id of input_blocks that have cross attention
+                block_indices = range(2) if id in [4, 5] else range(10) # transformer_depth
+                for index in block_indices:
+                    patch_kwargs["module_key"] = str(number*2+1)
+                    _set_model_patch_replace(work_model, patch_kwargs, ("input", id, index))
+                    number += 1
+            for id in range(6): # id of output_blocks that have cross attention
+                block_indices = range(2) if id in [3, 4, 5] else range(10) # transformer_depth
+                for index in block_indices:
+                    patch_kwargs["module_key"] = str(number*2+1)
+                    _set_model_patch_replace(work_model, patch_kwargs, ("output", id, index))
+                    number += 1
+            for index in range(10):
+                patch_kwargs["module_key"] = str(number*2+1)
+                _set_model_patch_replace(work_model, patch_kwargs, ("middle", 0, index))
+                number += 1
+                
+            self.current_work_model = work_model
+
+        return(work_model, image_prompt_embeds, uncond_image_prompt_embeds, face_kps, mask)
+    
 class ApplyInstantIDAdvanced(ApplyInstantID):
     @classmethod
     def INPUT_TYPES(s):
@@ -616,6 +737,7 @@ NODE_CLASS_MAPPINGS = {
     "InstantIDFaceAnalysis": InstantIDFaceAnalysis,
     "ApplyInstantID": ApplyInstantID,
     "ApplyInstantIDAdvanced": ApplyInstantIDAdvanced,
+    "ApplyInstantIDOnlyIpadapter": ApplyInstantIDOnlyIpadapter,
     "FaceKeypointsPreprocessor": FaceKeypointsPreprocessor,
 
     "InstantIDAttentionPatch": InstantIDAttentionPatch,
@@ -627,6 +749,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "InstantIDFaceAnalysis": "InstantID Face Analysis",
     "ApplyInstantID": "Apply InstantID",
     "ApplyInstantIDAdvanced": "Apply InstantID Advanced",
+    "ApplyInstantIDOnlyIpadapter": "Apply InstantID only ipadapter",
     "FaceKeypointsPreprocessor": "Face Keypoints Preprocessor",
 
     "InstantIDAttentionPatch": "InstantID Patch Attention",
